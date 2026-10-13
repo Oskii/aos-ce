@@ -16,6 +16,8 @@ use serde::Serialize;
 mod native_setup_tests;
 #[path = "cli_boundary/principals_tests.rs"]
 mod principals_tests;
+#[path = "cli_boundary/receipt_upgrade_tests.rs"]
+mod receipt_upgrade_tests;
 
 struct Fixture {
     root: PathBuf,
@@ -37,7 +39,10 @@ impl Fixture {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).expect("create fixture");
-        let runtime = root.join("fake-runtime");
+        let runtime = root
+            .join("runtime-home/releases")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("runtime/bin/astrid");
         let args = root.join("args");
         let bootstrap_args = root.join("bootstrap-args");
         let home = root.join("runtime-home");
@@ -83,19 +88,31 @@ impl Fixture {
     }
 
     fn install_signed_distro(&self) {
+        self.install_signed_distro_at(&self.release_dir(), env!("CARGO_PKG_VERSION"), None);
+    }
+
+    fn install_signed_distro_at(&self, release: &Path, version: &str, runtime: Option<&str>) {
         let keypair = KeyPair::from_secret_key(&[7_u8; 32]).expect("fixture signing key");
         let signing_pubkey = format!("ed25519:{}", keypair.export_public_key().to_base64());
         let embedded = include_str!("../../../distros/community/unicity-ce/Distro.toml");
         let original_pubkey = "ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=";
-        let manifest_bytes = embedded
-            .replace(original_pubkey, &signing_pubkey)
-            .into_bytes();
+        let text = embedded.replace(original_pubkey, &signing_pubkey);
+        let manifest_bytes = if let Some(runtime) = runtime {
+            let mut manifest: toml::Value = text.parse().expect("parse prior fixture manifest");
+            manifest["distro"]["version"] = version.into();
+            manifest["distro"]["astrid-version"] = format!(">={runtime}").into();
+            toml::to_string(&manifest)
+                .expect("encode prior fixture manifest")
+                .into_bytes()
+        } else {
+            text.into_bytes()
+        };
         let manifest_hash = format!("blake3:{}", blake3::hash(&manifest_bytes).to_hex());
         let lock = FixtureLock {
             schema_version: 1,
             distro: FixtureLockMeta {
                 id: "unicity-ce".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: version.to_owned(),
                 resolved_at: "2026-01-01T00:00:00Z".to_owned(),
             },
             capsules: Vec::new(),
@@ -110,11 +127,17 @@ impl Fixture {
         hasher.update(&canonical_lock);
         let signature = keypair.sign(hasher.finalize().as_bytes()).to_hex();
         let signature_bytes = format!("{signature}\n").into_bytes();
-        let release = self.release_dir();
+        fs::create_dir_all(release).expect("create signed release fixture");
         fs::write(release.join("Distro.toml"), &manifest_bytes).expect("write fixture Distro.toml");
         fs::write(release.join("Distro.lock"), &lock_bytes).expect("write fixture Distro.lock");
         fs::write(release.join("Distro.sig"), &signature_bytes).expect("write fixture Distro.sig");
+        let compatibility: toml::Value =
+            include_str!("../../../release/runtime-compatibility.toml")
+                .parse()
+                .expect("parse current runtime pin");
+        let current_runtime = compatibility["runtime"]["version"].as_str().unwrap();
         let release_manifest = serde_json::json!({
+            "runtime": {"version": runtime.unwrap_or(current_runtime)},
             "release_files": {
                 "Distro.toml": {
                     "blake3": blake3::hash(&manifest_bytes).to_hex().to_string(),
@@ -162,12 +185,15 @@ impl Fixture {
         let body = format!(
             "#!/bin/sh\n[ \"$1\" = --daemon-workspace ] && [ \"$2\" = \"$ASTRID_HOME\" ] || exit 97\nshift 2\n{body}"
         );
+        fs::create_dir_all(self.runtime.parent().unwrap())
+            .expect("create packaged runtime fixture");
         fs::write(&self.runtime, body).expect("write fake runtime");
         Self::make_executable(&self.runtime);
     }
 
     fn install_daemon(&self, body: &str) {
         let daemon = self.runtime.with_file_name("astrid-daemon");
+        fs::create_dir_all(daemon.parent().unwrap()).expect("create packaged daemon fixture");
         fs::write(&daemon, body).expect("write fake daemon");
         Self::make_executable(&daemon);
     }
