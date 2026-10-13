@@ -27,6 +27,7 @@ mod mcp;
 mod native_setup;
 mod principals;
 mod updates;
+mod version;
 
 use command_center::{open_command_center, runtime_start_requested};
 
@@ -54,6 +55,8 @@ struct ProductCli {
 
 #[derive(Subcommand)]
 enum ProductCommand {
+    /// Show the AOS product and its bundled Astrid runtime versions.
+    Version(version::Arguments),
     /// Print a file's BLAKE3 digest without starting or changing the runtime.
     Checksum { path: std::path::PathBuf },
     /// Open the terminal Command Center for approvals and private input.
@@ -181,6 +184,20 @@ enum UpdateChannel {
 }
 
 impl UpdateChannel {
+    fn installed_default() -> Self {
+        Self::for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    fn for_version(version: &str) -> Self {
+        if version.contains("-nightly.") {
+            Self::Nightly
+        } else if version.contains("-rc.") {
+            Self::Dev
+        } else {
+            Self::Stable
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
@@ -191,28 +208,7 @@ impl UpdateChannel {
 }
 
 fn parse_aos_version(value: &str) -> Result<String, String> {
-    let components = value.split('.').collect::<Vec<_>>();
-    let canonical = |component: &str| {
-        component == "0"
-            || (component.as_bytes().first().is_some_and(u8::is_ascii_digit)
-                && !component.starts_with('0')
-                && component.bytes().all(|byte| byte.is_ascii_digit()))
-    };
-    if components.len() != 3
-        || components[0].len() != 4
-        || !components[0].bytes().all(|byte| byte.is_ascii_digit())
-        || !canonical(components[1])
-        || !canonical(components[2])
-    {
-        return Err("expected YYYY.MINOR.PATCH without leading zeroes".to_owned());
-    }
-    let year = components[0]
-        .parse::<u16>()
-        .map_err(|_| "release year is invalid".to_owned())?;
-    if !(2026..=2099).contains(&year) {
-        return Err("release year must be between 2026 and 2099".to_owned());
-    }
-    Ok(value.to_owned())
+    version::parse_release(value)
 }
 
 #[derive(Args)]
@@ -360,6 +356,9 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     ) {
         Ok(cli) => cli,
         Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayVersion {
+                return Some(version::print(&version::Arguments::default()));
+            }
             let exit_code = if error.use_stderr() {
                 ExitCode::from(2)
             } else {
@@ -394,6 +393,7 @@ fn handle_product_command(args: &[OsString]) -> Option<ExitCode> {
     }
 
     match cli.command {
+        Some(ProductCommand::Version(args)) => Some(version::print(&args)),
         Some(ProductCommand::Checksum { path }) => Some(checksum::run(&path)),
         #[cfg(unix)]
         Some(ProductCommand::Console(args)) => Some(console::run(args)),
@@ -706,6 +706,7 @@ fn is_owned_root(value: &str) -> bool {
     matches!(
         value,
         "init"
+            | "version"
             | "checksum"
             | "status"
             | "migrate"
@@ -746,7 +747,7 @@ fn leading_owned_root(args: &[OsString]) -> Option<&str> {
         Ok(Some(index)) => args
             .get(index)
             .and_then(|arg| arg.to_str())
-            .filter(|root| is_owned_root(root)),
+            .filter(|root| is_owned_root(root) || matches!(*root, "-V" | "--version")),
         Ok(None) => None,
         Err(()) => args
             .iter()
@@ -760,7 +761,7 @@ fn leading_runtime_root_index(args: &[OsString]) -> Result<Option<usize>, ()> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_str().ok_or(())?;
-        if !arg.starts_with('-') {
+        if !arg.starts_with('-') || matches!(arg, "-V" | "--version") {
             return Ok(Some(index));
         }
         if arg == "--" {
@@ -875,7 +876,9 @@ fn handle_self_update(args: &UpdateArgs) -> ExitCode {
     } else {
         command.args([
             "--channel",
-            args.channel.unwrap_or(UpdateChannel::Stable).as_str(),
+            args.channel
+                .unwrap_or_else(UpdateChannel::installed_default)
+                .as_str(),
         ]);
     }
     if args.check {

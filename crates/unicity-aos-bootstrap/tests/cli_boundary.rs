@@ -838,6 +838,46 @@ exit 2
 }
 
 #[test]
+fn both_version_forms_report_product_and_runtime_without_delegation() {
+    let fixture = Fixture::new("product-version");
+    fixture.install_runtime(RECORDING_RUNTIME);
+    let compatibility: toml::Value = include_str!("../../../release/runtime-compatibility.toml")
+        .parse()
+        .unwrap();
+    let expected = format!(
+        "Unicity AOS {}\n  runtime: Astrid {}\n",
+        env!("CARGO_PKG_VERSION"),
+        compatibility["runtime"]["version"].as_str().unwrap()
+    );
+    for args in [
+        vec!["version"],
+        vec!["--version"],
+        vec!["-V"],
+        vec!["--principal", "alice", "--version"],
+        vec!["--principal=alice", "-V"],
+    ] {
+        let output = fixture.command().args(args).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(output.stderr.is_empty());
+        assert!(!fixture.args.exists());
+    }
+    let output = fixture
+        .command()
+        .args(["version", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["runtime_version"],
+        compatibility["runtime"]["version"].as_str().unwrap()
+    );
+    assert!(!fixture.args.exists());
+}
+
+#[test]
 fn product_help_version_and_usage_errors_never_delegate() {
     let fixture = Fixture::new("product-roots");
     fixture.install_runtime(RECORDING_RUNTIME);
@@ -1748,6 +1788,33 @@ exit 23
 }
 
 #[test]
+fn exact_prerelease_updates_reach_the_trusted_installer() {
+    let fixture = Fixture::new("exact-prerelease-update");
+    let libexec = fixture.home.join("libexec");
+    fs::create_dir_all(&libexec).unwrap();
+    fs::write(
+        libexec.join("install.sh"),
+        r#"#!/bin/sh
+[ "$*" = "--version $EXPECTED_VERSION --yes --no-migrate-prompt" ] || exit 91
+"#,
+    )
+    .unwrap();
+    for version in [
+        "2026.10.0-rc.7",
+        "2026.10.0-nightly.20261013.gaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let output = fixture
+            .command()
+            .args(["update", "--version", version])
+            .env("EXPECTED_VERSION", version)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(!fixture.args.exists());
+    }
+}
+
+#[test]
 fn update_check_is_read_only_and_uses_the_product_version() {
     let fixture = Fixture::new("update-check");
     let libexec = fixture.home.join("libexec");
@@ -1755,7 +1822,7 @@ fn update_check_is_read_only_and_uses_the_product_version() {
     fs::write(
         libexec.join("install.sh"),
         r#"#!/bin/sh
-test "$*" = '--channel stable --check' || exit 91
+test "$*" = "--channel $EXPECTED_CHANNEL --check" || exit 91
 test "$AOS_INSTALLED_VERSION" = "$EXPECTED_PRODUCT_VERSION" || exit 92
 exit 0
 "#,
@@ -1765,6 +1832,16 @@ exit 0
         .command()
         .args(["update", "--check"])
         .env("EXPECTED_PRODUCT_VERSION", env!("CARGO_PKG_VERSION"))
+        .env(
+            "EXPECTED_CHANNEL",
+            if env!("CARGO_PKG_VERSION").contains("-nightly.") {
+                "nightly"
+            } else if env!("CARGO_PKG_VERSION").contains("-rc.") {
+                "dev"
+            } else {
+                "stable"
+            },
+        )
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);

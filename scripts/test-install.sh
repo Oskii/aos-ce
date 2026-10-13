@@ -3,6 +3,50 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 sh "$repo_root/scripts/test_abandoned_install_cleanup.sh"
+python3 - "$repo_root/install.sh" <<'PYTEST'
+import pathlib, subprocess, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+function = "aos_version_newer() {" + source.split("aos_version_newer() {", 1)[1].split("\nif [ -n ", 1)[0]
+for selected, installed, newer in (
+    ("2026.9.4", "2026.10.0-rc.4", False),
+    ("2026.10.0-rc.5", "2026.10.0-rc.4", True),
+    ("2026.10.0-rc.10", "2026.10.0-rc.9", True),
+    ("2026.10.0-rc.9", "2026.10.0-rc.10", False),
+    ("2026.10.0", "2026.10.0-rc.4", True),
+    ("2026.10.0-rc.4", "2026.10.0", False),
+    ("2026.10.0-rc.4", "2026.10.0-rc.4", False),
+    ("2026.10.0-nightly.20261014.g" + "a" * 40,
+     "2026.10.0-nightly.20261013.g" + "b" * 40, True),
+):
+    result = subprocess.run(["sh", "-c", function + '\naos_version_newer "$1" "$2"', "compare", selected, installed])
+    assert (result.returncode == 0) == newer, (selected, installed)
+PYTEST
+python3 - "$repo_root/install.sh" <<'PYNOTICE'
+import pathlib, subprocess, sys, tempfile
+source = pathlib.Path(sys.argv[1]).read_text()
+function = "clear_host_update_notice() {" + source.split("clear_host_update_notice() {", 1)[1].split("\n# Both replacement", 1)[0]
+with tempfile.TemporaryDirectory() as raw:
+    home = pathlib.Path(raw).resolve()
+    state = home / "update/host-update-check"
+    state.mkdir(parents=True)
+    for name in ("available", "stamp", "retry", "keep"):
+        (state / name).write_text("old notice")
+    command = ["sh", "-c", function + '\nAOS_HOME=$1; clear_host_update_notice', "clear", str(home)]
+    subprocess.run(command, check=True)
+    assert list(p.name for p in state.iterdir()) == ["keep"]
+    (state / "available").write_text("undeletable notice")
+    failure_command = ["sh", "-c", 'set -e\nrm() { return 1; }\n' + function
+                       + '\nAOS_HOME=$1; clear_host_update_notice; printf "completed"', "clear", str(home)]
+    result = subprocess.run(failure_command, capture_output=True, text=True)
+    assert result.returncode == 0 and result.stdout == "completed", result
+    assert (state / "available").read_text() == "undeletable notice"
+    state.rename(home / "outside")
+    state.symlink_to(home / "outside", target_is_directory=True)
+    (home / "outside/available").write_text("must survive")
+    subprocess.run(command, check=True)
+    assert (home / "outside/available").read_text() == "must survive"
+PYNOTICE
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fixture="$work/fixture"
@@ -1315,7 +1359,7 @@ cp "$fixture/channel.toml" "$fixture/channel-good.toml"
 
 # A notification must authenticate metadata but never install, create the home,
 # advance channel state, or download a product archive.
-for installed_version in 2026.9.2 2026.9.3; do
+for installed_version in 2026.9.2 2026.9.3 2026.10.0-rc.4; do
   check_home="$work/check-$installed_version"
   PATH="$fake_bin:$PATH" AOS_HOME="$check_home" AOS_TEST_FIXTURE="$fixture" \
     AOS_INSTALLED_VERSION="$installed_version" \
@@ -1328,6 +1372,12 @@ for installed_version in 2026.9.2 2026.9.3; do
 done
 grep -q '^Update available: AOS 2026.9.2 -> 2026.9.3' "$work/check-2026.9.2.log"
 grep -q '^AOS 2026.9.3 matches the signed stable channel' "$work/check-2026.9.3.log"
+
+grep -q '^AOS 2026.10.0-rc.4 is ahead of the signed stable channel' "$work/check-2026.10.0-rc.4.log"
+if grep -q 'Update available' "$work/check-2026.10.0-rc.4.log"; then
+  echo 'update notice offered a downgrade' >&2
+  exit 1
+fi
 
 # The machine interface must contain JSON only, preserve both version
 # identities (including an installed version ahead of stable), and write no home.
