@@ -1963,6 +1963,14 @@ if [ "$artifact_cache_pending" -eq 1 ]; then
     fi
   done
 fi
+if [ "$os" = Linux ] && ! ASTRID_HOME="$AOS_HOME/runtime" \
+  ASTRID_RUN_DIR="$AOS_HOME/run" ASTRID_WORKSPACE_STATE_DIR=.aos \
+  PATH="$release_dir/runtime/bin:$PATH" \
+  "$release_dir/runtime/bin/astrid" setup; then
+  echo "Installed Unicity AOS $staged_version, but Linux host setup is incomplete." >&2
+  echo "Resolve the checks above, then rerun $AOS_BIN_DIR/aos setup before using AOS." >&2
+  exit 1
+fi
 echo "Installed Unicity AOS $staged_version."
 case ":$PATH:" in
   *":$AOS_BIN_DIR:"*) init_command="aos init" ;;
