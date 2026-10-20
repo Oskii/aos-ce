@@ -108,6 +108,60 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regular file"):
             TRANSACTION.pack(args)
 
+    def test_substituted_output_symlink_is_not_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_bytes(b"keep")
+        self.output.symlink_to(victim)
+        original = TRANSACTION.require
+
+        def require(condition: bool, message: str) -> None:
+            if message == "transaction output already exists":
+                return
+            original(condition, message)
+
+        TRANSACTION.require = require
+        try:
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                self.pack()
+        finally:
+            TRANSACTION.require = original
+        self.assertEqual(victim.read_bytes(), b"keep")
+
+    def test_substituted_output_directory_is_not_followed(self) -> None:
+        self.pack()
+        other = self.root / "other"
+        other.mkdir()
+        link = self.root / "via-link"
+        link.symlink_to(other, target_is_directory=True)
+        original = TRANSACTION.require
+
+        def require(condition: bool, message: str) -> None:
+            if message in {
+                "output directory must be a real directory",
+                "output directory must be empty",
+            }:
+                return
+            original(condition, message)
+
+        TRANSACTION.require = require
+        args = type(
+            "Args",
+            (),
+            {
+                "channel": "stable",
+                "generation": 7,
+                "input": self.output,
+                "output_dir": link,
+            },
+        )()
+        try:
+            with self.assertRaisesRegex(ValueError, "real directory"):
+                TRANSACTION.unpack(args)
+        finally:
+            TRANSACTION.require = original
+        self.assertFalse((other / "channel.toml").exists())
+        self.assertFalse((other / "channel.toml.sigstore.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

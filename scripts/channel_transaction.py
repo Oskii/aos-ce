@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno
 import json
 import os
 import re
@@ -50,6 +51,35 @@ def encode(value: bytes) -> str:
     return base64.b64encode(value).decode("ascii")
 
 
+def open_nofollow(path: str | Path, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
+    """Open a path without following a symlink substituted for the final component."""
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if dir_fd is None:
+            return os.open(path, flags, mode)
+        return os.open(path, flags, mode, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ELOOP}:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(path)) from error
+        raise
+
+
+def create_regular_file(path: Path, payload: bytes) -> None:
+    descriptor = open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def open_real_directory(path: Path) -> int:
+    try:
+        return open_nofollow(path, os.O_RDONLY | os.O_DIRECTORY, 0)
+    except OSError as error:
+        raise ValueError("output directory must be a real directory") from error
+
+
 def decode(value: Any, maximum: int, context: str) -> bytes:
     require(isinstance(value, str) and value != "", f"{context} must be non-empty base64")
     require(re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", value) is not None, f"{context} is malformed")
@@ -82,7 +112,10 @@ def pack(args: argparse.Namespace) -> None:
     }
     encoded = (json.dumps(transaction, sort_keys=True, separators=(",", ":")) + "\n").encode()
     require(len(encoded) <= MAX_TRANSACTION_BYTES, "transaction is too large")
-    args.output.write_bytes(encoded)
+    try:
+        create_regular_file(args.output, encoded)
+    except FileExistsError as error:
+        raise ValueError("transaction output already exists") from error
 
 
 def load_transaction(path: Path) -> dict[str, Any]:
@@ -113,26 +146,31 @@ def unpack(args: argparse.Namespace) -> None:
     require(transaction["channel"] == args.channel, "transaction channel does not match")
     require(transaction["generation"] == args.generation, "transaction generation does not match")
     require(args.output_dir.is_dir() and not args.output_dir.is_symlink(), "output directory must be a real directory")
-    require(not any(args.output_dir.iterdir()), "output directory must be empty")
     pointer = decode(
         transaction["channel-toml-base64"], MAX_POINTER_BYTES, "channel-toml-base64"
     )
     bundle = decode(
         transaction["sigstore-bundle-base64"], MAX_BUNDLE_BYTES, "sigstore-bundle-base64"
     )
-    for name, payload in (
-        ("channel.toml", pointer),
-        ("channel.toml.sigstore.json", bundle),
-    ):
-        descriptor = os.open(
-            args.output_dir / name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
+    directory = open_real_directory(args.output_dir)
+    try:
+        require(not os.listdir(directory), "output directory must be empty")
+        for name, payload in (
+            ("channel.toml", pointer),
+            ("channel.toml.sigstore.json", bundle),
+        ):
+            descriptor = open_nofollow(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                dir_fd=directory,
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def parser() -> argparse.ArgumentParser:
