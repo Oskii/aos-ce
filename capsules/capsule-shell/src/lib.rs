@@ -192,14 +192,14 @@ const BLOCKED_COMMANDS: &[&str] = &[
 
 /// Shell operators that chain multiple commands. We split on these to check
 /// each sub-command independently for catastrophic patterns.
-const SHELL_CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|"];
+const SHELL_CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|", "\r\n", "\n", "\r"];
 
 /// Check if a command is catastrophic and should be hard-denied before
 /// reaching the approval prompt.
 ///
-/// Splits on shell chaining operators (`&&`, `||`, `;`, `|`) and checks
-/// each sub-command independently. `ls && rm -rf /` is caught even though
-/// the first command is benign.
+/// Splits on shell chaining operators (`&&`, `||`, `;`, `|`, `&`, and newlines)
+/// and checks each sub-command independently. `ls && rm -rf /` is caught even
+/// though the first command is benign.
 ///
 /// Returns `Some(reason)` if the command is blocked, `None` if safe to proceed.
 fn check_catastrophic(command: &str) -> Option<&'static str> {
@@ -221,8 +221,8 @@ fn check_catastrophic(command: &str) -> Option<&'static str> {
 /// Split a command string on shell chaining operators.
 fn split_on_shell_operators(command: &str) -> Vec<&str> {
     // Replace multi-char operators with a single sentinel, then split.
-    // We need to handle &&, ||, ;, | - but | is a substring of ||,
-    // so we process longer operators first.
+    // We need to handle &&, ||, ;, |, newlines, and standalone & -
+    // longer operators are processed first so || and && are split before | and &.
     let mut result = vec![command];
     for op in SHELL_CHAIN_OPERATORS {
         let mut next = Vec::new();
@@ -233,7 +233,32 @@ fn split_on_shell_operators(command: &str) -> Vec<&str> {
         }
         result = next;
     }
-    result
+
+    let mut final_parts = Vec::new();
+    for segment in result {
+        final_parts.extend(split_on_background_operator(segment));
+    }
+    final_parts
+}
+
+/// Split a segment on standalone `&` background operators without breaking
+/// file-descriptor redirections such as `2>&1`, `<&0`, or `&>`.
+fn split_on_background_operator(segment: &str) -> Vec<&str> {
+    let bytes = segment.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'&' {
+            let prev_redir = i > 0 && matches!(bytes[i - 1], b'>' | b'<');
+            let next_redir = i + 1 < bytes.len() && bytes[i + 1] == b'>';
+            if !prev_redir && !next_redir {
+                parts.push(&segment[start..i]);
+                start = i + 1;
+            }
+        }
+    }
+    parts.push(&segment[start..]);
+    parts
 }
 
 /// Check a single command (no shell operators) for catastrophic patterns.
@@ -336,6 +361,13 @@ fn is_protected_path(path: &str) -> bool {
 /// rm /tmp/foo                       -> "rm /tmp/foo"
 /// ```
 fn extract_action(command: &str) -> String {
+    if split_on_shell_operators(command).len() > 1 {
+        // SECURITY: Chained or multi-line commands must use exact-match
+        // fallback so a second command cannot piggyback on the first
+        // program's subcommand allowance (e.g. "git status && ...").
+        return command.to_string();
+    }
+
     let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.is_empty() || tokens[0].starts_with('-') {
         return String::new();
@@ -723,6 +755,29 @@ mod tests {
         assert_eq!(extract_action("--help"), "");
     }
 
+    #[test]
+    fn action_chained_known_program_returns_full_command() {
+        // Chained commands starting with a whitelisted program must not
+        // collapse to the first program's subcommand allowance.
+        assert_eq!(
+            extract_action("git status && rm -rf /tmp/foo"),
+            "git status && rm -rf /tmp/foo"
+        );
+        assert_eq!(
+            extract_action("cargo build; sh deploy.sh"),
+            "cargo build; sh deploy.sh"
+        );
+        assert_eq!(extract_action("git status | sh"), "git status | sh");
+        assert_eq!(
+            extract_action("git status & rm -rf /tmp/foo"),
+            "git status & rm -rf /tmp/foo"
+        );
+        assert_eq!(
+            extract_action("git status\nrm -rf /tmp/foo"),
+            "git status\nrm -rf /tmp/foo"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Catastrophic command blocking
     // -----------------------------------------------------------------------
@@ -792,9 +847,15 @@ mod tests {
         assert!(check_catastrophic("echo hello; shutdown -h now").is_some());
         assert!(check_catastrophic("cat /tmp/f || rm -rf /usr").is_some());
         assert!(check_catastrophic("ls | dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(check_catastrophic("ls & rm -rf /usr").is_some());
+        assert!(check_catastrophic("ls\nrm -rf /").is_some());
+        assert!(check_catastrophic("echo hello\r\nshutdown -h now").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero 2>&1 of=/dev/sda").is_some());
         // Both safe - should pass
         assert!(check_catastrophic("ls && echo done").is_none());
         assert!(check_catastrophic("cat foo; echo bar").is_none());
+        assert!(check_catastrophic("ls\necho done").is_none());
+        assert!(check_catastrophic("cargo build 2>&1").is_none());
     }
 
     #[test]
