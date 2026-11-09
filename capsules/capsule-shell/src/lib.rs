@@ -264,15 +264,110 @@ fn split_on_background_operator(segment: &str) -> Vec<&str> {
 /// Wrapper utilities that delegate execution to a subsequent command token.
 const COMMAND_WRAPPERS: &[&str] = &["sudo", "env", "command", "nohup", "nice", "exec", "time"];
 
-/// Strip surrounding single or double quotes from a shell token.
-fn unquote_token(token: &str) -> &str {
-    token.trim_matches(|c| c == '"' || c == '\'')
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
+/// Remove shell quotes (`'...'`, `"..."`) and backslash escapes across a token.
+fn unquote_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    let mut state = QuoteState::None;
+
+    while let Some(c) = chars.next() {
+        match state {
+            QuoteState::None => match c {
+                '\'' => state = QuoteState::Single,
+                '"' => state = QuoteState::Double,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                _ => out.push(c),
+            },
+            QuoteState::Single => {
+                if c == '\'' {
+                    state = QuoteState::None;
+                } else {
+                    out.push(c);
+                }
+            }
+            QuoteState::Double => match c {
+                '"' => state = QuoteState::None,
+                '\\' => {
+                    if let Some(&next) = chars.peek() {
+                        if matches!(next, '$' | '`' | '"' | '\\') {
+                            out.push(chars.next().unwrap());
+                        } else {
+                            out.push('\\');
+                        }
+                    } else {
+                        out.push('\\');
+                    }
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+
+    out
 }
 
 /// Extract the bare executable name from a potentially quoted or path-qualified token.
-fn program_basename(token: &str) -> &str {
+fn program_basename(token: &str) -> String {
     let unquoted = unquote_token(token);
-    unquoted.rsplit('/').next().unwrap_or(unquoted)
+    unquoted
+        .rsplit('/')
+        .next()
+        .unwrap_or(unquoted.as_str())
+        .to_string()
+}
+
+/// Whether a short option on `wrapper` consumes a separate following argument token
+/// when it appears at the end of a short-option cluster.
+fn wrapper_short_opt_takes_arg(wrapper: &str, opt: char) -> bool {
+    match wrapper {
+        "sudo" => matches!(
+            opt,
+            'a' | 'C' | 'c' | 'D' | 'f' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'U' | 'u'
+        ),
+        "env" => matches!(opt, 'u' | 'C' | 'S' | 'P'),
+        "nice" => opt == 'n',
+        "exec" => opt == 'a',
+        "time" => matches!(opt, 'f' | 'o'),
+        _ => false,
+    }
+}
+
+/// Whether a long option on `wrapper` consumes a separate following argument token
+/// when written without an inline `=value`.
+fn wrapper_long_opt_takes_arg(wrapper: &str, opt: &str) -> bool {
+    match wrapper {
+        "sudo" => matches!(
+            opt,
+            "--auth-type"
+                | "--chdir"
+                | "--chroot"
+                | "--close-from"
+                | "--command-timeout"
+                | "--group"
+                | "--host"
+                | "--login-class"
+                | "--other-user"
+                | "--prompt"
+                | "--role"
+                | "--type"
+                | "--user"
+        ),
+        "env" => matches!(opt, "--unset" | "--chdir" | "--split-string"),
+        "nice" => opt == "--adjustment",
+        "time" => matches!(opt, "--format" | "--output"),
+        _ => false,
+    }
 }
 
 /// Advance past leading `KEY=VALUE` assignments and command wrappers (`sudo`, `env`, etc.).
@@ -284,11 +379,42 @@ fn strip_wrappers<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
             idx += 1;
             continue;
         }
-        let base = program_basename(token);
-        if COMMAND_WRAPPERS.contains(&base) {
+        let base = program_basename(tokens[idx]);
+        if COMMAND_WRAPPERS.contains(&base.as_str()) {
             idx += 1;
-            while idx < tokens.len() && unquote_token(tokens[idx]).starts_with('-') {
+            while idx < tokens.len() {
+                let opt = unquote_token(tokens[idx]);
+                if !opt.starts_with('-') {
+                    break;
+                }
+                if opt == "--" {
+                    idx += 1;
+                    break;
+                }
+                if opt == "-" {
+                    idx += 1;
+                    continue;
+                }
+                if opt.starts_with("--") {
+                    idx += 1;
+                    if !opt.contains('=')
+                        && wrapper_long_opt_takes_arg(&base, &opt)
+                        && idx < tokens.len()
+                    {
+                        idx += 1;
+                    }
+                    continue;
+                }
                 idx += 1;
+                let mut chars = opt[1..].chars();
+                while let Some(c) = chars.next() {
+                    if wrapper_short_opt_takes_arg(&base, c) {
+                        if chars.as_str().is_empty() && idx < tokens.len() {
+                            idx += 1;
+                        }
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -308,7 +434,7 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
     let program = program_basename(tokens[0]);
 
     // Unconditionally blocked commands
-    if BLOCKED_COMMANDS.contains(&program) {
+    if BLOCKED_COMMANDS.contains(&program.as_str()) {
         return Some(
             "This command is blocked for safety. It can cause irreversible system damage.",
         );
@@ -319,14 +445,14 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
         && tokens[1..].iter().any(|t| {
             unquote_token(t)
                 .strip_prefix("of=")
-                .is_some_and(|path| normalize_shell_path(path).starts_with("/dev/"))
+                .is_some_and(|path| normalize_unquoted_path(path).starts_with("/dev/"))
         })
     {
         return Some("Writing directly to block devices via dd is blocked.");
     }
 
     // chmod/chown -R on system paths
-    if matches!(program, "chmod" | "chown")
+    if matches!(program.as_str(), "chmod" | "chown")
         && tokens[1..].iter().any(|t| {
             let flag = unquote_token(t);
             flag == "-R" || flag == "--recursive" || flag.starts_with("-R")
@@ -361,6 +487,10 @@ fn check_single_command_catastrophic(command: &str) -> Option<&'static str> {
 /// absolute paths so `/tmp/..` and `/tmp/../etc` are recognized as `/` and `/etc`.
 fn normalize_shell_path(raw: &str) -> String {
     let unquoted = unquote_token(raw);
+    normalize_unquoted_path(&unquoted)
+}
+
+fn normalize_unquoted_path(unquoted: &str) -> String {
     let expanded = if unquoted == "~" || unquoted == "$HOME" || unquoted == "${HOME}" {
         "/home/user".to_string()
     } else if let Some(rest) = unquoted
@@ -961,6 +1091,19 @@ mod tests {
         assert!(check_catastrophic("chmod -R 777 \"/etc\"").is_some());
         assert!(check_catastrophic("dd if=/dev/zero of=\"/dev/sda\"").is_some());
         assert!(check_catastrophic("dd if=/dev/zero \"of=/dev/sda\"").is_some());
+        // Interior quotes and backslash escapes within a shell word
+        assert!(check_catastrophic("rm -rf /tmp/\"../etc\"").is_some());
+        assert!(check_catastrophic("rm -rf /tmp/../\"etc\"").is_some());
+        assert!(check_catastrophic("rm -rf /tmp/'../etc'").is_some());
+        assert!(check_catastrophic("rm -rf /tmp/\\.\\./etc").is_some());
+        assert!(check_catastrophic("chmod -R 777 /tmp/\"../etc\"").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero of=/tmp/\"../dev/sda\"").is_some());
+        assert!(check_catastrophic("dd if=/dev/zero of=/tmp/\\.\\./dev/sda").is_some());
+        // Quoted safe paths remain allowed
+        assert!(check_catastrophic("rm -rf \"/tmp/build\"").is_none());
+        assert!(check_catastrophic("rm -rf /tmp/\"build\"").is_none());
+        assert!(check_catastrophic("rm -rf '/tmp/build'").is_none());
+        assert!(check_catastrophic("rm -rf /tmp/\"a\"/../\"build\"").is_none());
     }
 
     #[test]
@@ -981,7 +1124,24 @@ mod tests {
         assert!(check_catastrophic("/usr/sbin/mkfs.ext4 /dev/sda1").is_some());
         assert!(check_catastrophic("sudo rm -rf /").is_some());
         assert!(check_catastrophic("sudo -n rm -rf /etc").is_some());
+        assert!(check_catastrophic("sudo -u root rm -rf /").is_some());
+        assert!(check_catastrophic("sudo -uroot rm -rf /").is_some());
+        assert!(check_catastrophic("sudo -Eu root rm -rf /").is_some());
+        assert!(check_catastrophic("sudo --user root rm -rf /").is_some());
+        assert!(check_catastrophic("sudo --user=root rm -rf /").is_some());
         assert!(check_catastrophic("env rm -rf /").is_some());
+        assert!(check_catastrophic("env -u FOO rm -rf /").is_some());
+        assert!(check_catastrophic("env --unset FOO rm -rf /").is_some());
+        assert!(check_catastrophic("env -C /tmp rm -rf /").is_some());
+        assert!(check_catastrophic("nice -n 5 rm -rf /").is_some());
+        assert!(check_catastrophic("nice -n -5 rm -rf /").is_some());
+        assert!(check_catastrophic("nice --adjustment 5 rm -rf /").is_some());
+        assert!(check_catastrophic("exec -a fake rm -rf /").is_some());
+        assert!(check_catastrophic("time -o /tmp/t.log rm -rf /").is_some());
         assert!(check_catastrophic("command -p rm -rf /").is_some());
+        // Harmless wrapped commands remain allowed
+        assert!(check_catastrophic("sudo -u root rm -rf /tmp/build").is_none());
+        assert!(check_catastrophic("env -u FOO cargo build --release").is_none());
+        assert!(check_catastrophic("nice -n 5 ls -la /etc").is_none());
     }
 }
